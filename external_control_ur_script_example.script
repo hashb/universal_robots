@@ -1,0 +1,428 @@
+def ec_external_control():
+    textmsg("external_control init starting")
+
+    #--------------------------------------------------------------------
+    # CONSTANTS
+    #--------------------------------------------------------------------
+    # input registers
+    #    int
+    ec_DESIRED_MODE_INPUT_INT_REG = 24
+    ec_SEQUENCE_ID_INPUT_INT_REG = 25
+    ec_EXTERNAL_ERROR_INPUT_INT_REG = 26
+    ec_EXTERNAL_SYNC_STATE_INPUT_INT_REG = 27
+
+    #    float/double
+    ec_DESIRED_JOINT_POSITIONS_BASE_INPUT_FLOAT_REG = 24 #24 - 29
+    ec_MAX_JOINT_DIVERGENCE_THRESHOLDS_BASE_INPUT_FLOAT_REG = 30 #30 - 35
+    ec_PAYLOAD_MASS_INPUT_FLOAT_REG = 36
+    ec_PAYLOAD_COG_VECTOR_BASE_INPUT_FLOAT_REG = 37 #37 - 39
+    ec_STATE_TIME_INPUT_FLOAT_REG = 46
+
+    # output registers
+    #    int
+    ec_ACTUAL_MODE_OUTPUT_INT_REG = 24
+    ec_LAST_SEQUENCE_ID_OUTPUT_INT_REG = 25
+
+    #    double
+    ec_LAG_TIME_OUTPUT_FLOAT_REG = 24
+
+    # modes
+    ec_MODE_IDLE = 0
+    ec_MODE_TEACH = 1
+    ec_MODE_SERVO = 2
+
+    # External synchronization state
+    ec_SYNC_STATE_WAITING_TO_CONNECT = 0
+    ec_SYNC_STATE_NONE = 1
+    ec_SYNC_STATE_EXTERNAL_TO_ROBOT = 2
+    ec_SYNC_STATE_ROBOT_TO_EXTERNAL = 3
+
+    # stale sequence ID counter limit
+    ec_STALE_SEQUENCE_ID_COUNTER_LIMIT = 2000 # 4000ms (1 count = 2 milliseconds)
+
+    # external errors
+    ec_ERROR_NONE = 0
+    ec_ERROR_HALT = 1
+
+    # servoj parameters (determined experimentally, UR defaults shown)
+    # servoj(q, a=NOT_USED, v=NOT_USED, t=0.002, lookahead_time=0.1, gain=300)
+    ec_SERVOJ_T = 0.002
+    ec_SERVOJ_LOOKAHEAD_TIME = 0.06
+    ec_SERVOJ_GAIN = 1000
+
+    #--------------------------------------------------------------------
+    # globals
+    #--------------------------------------------------------------------
+    ec_actual_mode = ec_MODE_IDLE
+    ec_last_mode = ec_actual_mode
+    ec_last_mode_comm = ec_actual_mode
+    ec_desired_mode = ec_actual_mode
+    ec_sync_state = ec_SYNC_STATE_WAITING_TO_CONNECT
+    ec_sequence_id = 0
+    ec_last_sequence_id = 0
+    ec_stale_sequence_id_counter = 0
+
+    ec_external_error = ec_ERROR_NONE
+
+    global ec_desired_joint_positions = get_actual_joint_positions()
+    global ec_desired_movement_time = get_steptime()
+
+    global ec_joint_convergence_thresholds = [0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+    global ec_max_joint_divergence_thresholds = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    ec_last_max_joint_divergence_thresholds = ec_max_joint_divergence_thresholds
+
+    ec_robot_model = "UR5"
+
+    ec_payload_mass = 0.0
+
+    ec_min_payload = 0.0
+    if ec_robot_model == "UR3":
+        ec_max_payload = 3.0
+    elif ec_robot_model == "UR5":
+        ec_max_payload = 5.0
+    elif ec_robot_model == "UR10":
+        ec_max_payload = 10.0
+    elif ec_robot_model == "UR16":
+        ec_max_payload = 16.0
+    else:
+        ec_max_payload = 5.0
+    end
+
+    ec_last_payload_mass = ec_payload_mass
+    ec_payload_cog = [0.0, 0.0, 0.0]
+    ec_last_payload_cog = ec_payload_cog
+
+    textmsg("external_control init done for model: ", ec_robot_model)
+    textmsg("Max payload set to ", ec_max_payload)
+
+    ##################################
+    # Waypoint Buffer Management
+    ##################################
+
+    # Prepare buffer matrix
+    # Create time buffer of 1000 elements
+    ec_buf_t = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    ec_qbuf = transpose([ec_buf_t]) * [ec_desired_joint_positions]
+    ec_buf_t = ec_buf_t * 0.0
+    global ec_buf_front = 0
+    global ec_buf_back = 0
+    global ec_buf_size = 0
+    ec_buf_cap = size(ec_buf_t)
+    global ec_buf_can_pop = False
+    global ec_lag_time = 0.0
+    ec_last_state_time = 0.0
+
+    def updateSize():
+        diff = ec_buf_back - ec_buf_front
+        if (0 > diff):
+            diff = diff + ec_buf_cap
+        end
+        if (ec_buf_can_pop == True):
+            ec_buf_size = diff + 1
+        else:
+            ec_buf_size = 0
+        end
+    end
+
+    def next_index():
+        nextIndex = (ec_buf_back + 1) % ec_buf_cap
+        if (nextIndex == ec_buf_front):
+            return -1
+        end
+        return nextIndex
+    end
+
+    def push():
+        nextIndex = (ec_buf_back + 1) % ec_buf_cap
+        if (nextIndex == ec_buf_front):
+            return False
+        end
+        ec_buf_back = nextIndex
+        if (ec_buf_can_pop == False):
+            ec_buf_front = ec_buf_back
+            ec_buf_can_pop = True
+        end
+        updateSize()
+        return True
+    end
+
+    def pop():
+        if (ec_buf_can_pop == False):
+            return False
+        end
+        if (ec_buf_front == ec_buf_back):
+            ec_buf_can_pop = False
+        else:
+            ec_buf_front = (ec_buf_front + 1) % ec_buf_cap
+        end
+        updateSize()
+        return True
+    end
+
+    def reset_buf():
+        ec_buf_back = ec_buf_front
+        ec_buf_size = 0
+        ec_buf_can_pop = False
+        updateSize()
+
+        ec_lag_time = 0.0
+        ec_last_state_time = read_input_float_register(ec_STATE_TIME_INPUT_FLOAT_REG) - get_steptime()
+    end
+
+    global num_push = 0
+    global num_pop = 0
+
+    def push_waypoint():
+        state_time = read_input_float_register(ec_STATE_TIME_INPUT_FLOAT_REG)
+        waypoint_time = state_time - ec_last_state_time
+        if (waypoint_time > 50 * get_steptime() or waypoint_time < 0.0):
+            waypoint_time = get_steptime()
+        elif (waypoint_time == 0.0):
+            return None
+        end
+        ec_last_state_time = state_time
+
+        nextIndex = next_index()
+        if (nextIndex < 0):
+            textmsg("Buffer overflow")
+            nextIndex = ec_buf_back
+        end
+
+        ec_buf_t[nextIndex] = waypoint_time
+
+        ec_qbuf[nextIndex, 0] = read_input_float_register(ec_DESIRED_JOINT_POSITIONS_BASE_INPUT_FLOAT_REG + 0)
+        ec_qbuf[nextIndex, 1] = read_input_float_register(ec_DESIRED_JOINT_POSITIONS_BASE_INPUT_FLOAT_REG + 1)
+        ec_qbuf[nextIndex, 2] = read_input_float_register(ec_DESIRED_JOINT_POSITIONS_BASE_INPUT_FLOAT_REG + 2)
+        ec_qbuf[nextIndex, 3] = read_input_float_register(ec_DESIRED_JOINT_POSITIONS_BASE_INPUT_FLOAT_REG + 3)
+        ec_qbuf[nextIndex, 4] = read_input_float_register(ec_DESIRED_JOINT_POSITIONS_BASE_INPUT_FLOAT_REG + 4)
+        ec_qbuf[nextIndex, 5] = read_input_float_register(ec_DESIRED_JOINT_POSITIONS_BASE_INPUT_FLOAT_REG + 5)
+
+        push()
+        ec_lag_time = ec_lag_time + waypoint_time
+        num_push = num_push + 1
+    end
+
+    def pop_waypoint():
+        ec_desired_joint_positions[0] = ec_qbuf[ec_buf_front, 0]
+        ec_desired_joint_positions[1] = ec_qbuf[ec_buf_front, 1]
+        ec_desired_joint_positions[2] = ec_qbuf[ec_buf_front, 2]
+        ec_desired_joint_positions[3] = ec_qbuf[ec_buf_front, 3]
+        ec_desired_joint_positions[4] = ec_qbuf[ec_buf_front, 4]
+        ec_desired_joint_positions[5] = ec_qbuf[ec_buf_front, 5]
+
+        ec_desired_movement_time = ec_buf_t[ec_buf_front]
+
+        if (pop() == True):
+            ec_lag_time = ec_lag_time - ec_desired_movement_time
+            num_pop = num_pop + 1
+            return True
+        else:
+            popup("Buffer underflow")
+            textmsg("Buffer underflow")
+            return False
+        end
+    end
+
+    ##################################
+    # Communication Thread
+    ##################################
+    thread external_comm_thread():
+        while (True):
+            # read input registers (from external controller)
+            # int registers
+            ec_desired_mode = read_input_integer_register(ec_DESIRED_MODE_INPUT_INT_REG)
+            ec_sequence_id = read_input_integer_register(ec_SEQUENCE_ID_INPUT_INT_REG)
+            ec_external_error = read_input_integer_register(ec_EXTERNAL_ERROR_INPUT_INT_REG)
+            ec_sync_state = read_input_integer_register(ec_EXTERNAL_SYNC_STATE_INPUT_INT_REG)
+
+            # double registers
+            ec_max_joint_divergence_thresholds[0] = read_input_float_register(ec_MAX_JOINT_DIVERGENCE_THRESHOLDS_BASE_INPUT_FLOAT_REG + 0)
+            ec_max_joint_divergence_thresholds[1] = read_input_float_register(ec_MAX_JOINT_DIVERGENCE_THRESHOLDS_BASE_INPUT_FLOAT_REG + 1)
+            ec_max_joint_divergence_thresholds[2] = read_input_float_register(ec_MAX_JOINT_DIVERGENCE_THRESHOLDS_BASE_INPUT_FLOAT_REG + 2)
+            ec_max_joint_divergence_thresholds[3] = read_input_float_register(ec_MAX_JOINT_DIVERGENCE_THRESHOLDS_BASE_INPUT_FLOAT_REG + 3)
+            ec_max_joint_divergence_thresholds[4] = read_input_float_register(ec_MAX_JOINT_DIVERGENCE_THRESHOLDS_BASE_INPUT_FLOAT_REG + 4)
+            ec_max_joint_divergence_thresholds[5] = read_input_float_register(ec_MAX_JOINT_DIVERGENCE_THRESHOLDS_BASE_INPUT_FLOAT_REG + 5)
+            ec_payload_mass = read_input_float_register(ec_PAYLOAD_MASS_INPUT_FLOAT_REG)
+            ec_payload_cog[0] = read_input_float_register(ec_PAYLOAD_COG_VECTOR_BASE_INPUT_FLOAT_REG + 0) #x
+            ec_payload_cog[1] = read_input_float_register(ec_PAYLOAD_COG_VECTOR_BASE_INPUT_FLOAT_REG + 1) #y
+            ec_payload_cog[2] = read_input_float_register(ec_PAYLOAD_COG_VECTOR_BASE_INPUT_FLOAT_REG + 2) #z
+
+            # halt for any external_error
+            if (ec_external_error != ec_ERROR_NONE):
+                if (ec_external_error == ec_ERROR_HALT):
+                    textmsg("stopping external control")
+                else:
+                    textmsg("unknown external error received: external_error = ", ec_external_error)
+                end
+                halt
+            end
+
+            # set the payload
+            if ((ec_payload_mass != ec_last_payload_mass) or (ec_payload_cog != ec_last_payload_cog)):
+                if ((ec_payload_mass >= ec_min_payload) and (ec_max_payload >= ec_payload_mass)):
+                    set_payload(ec_payload_mass, ec_payload_cog)
+                    textmsg("payload mass = ", ec_payload_mass)
+                    textmsg("payload cog = ", ec_payload_cog)
+                    ec_last_payload_mass = ec_payload_mass
+                    ec_last_payload_cog = ec_payload_cog
+                else:
+                    textmsg("Payload mass value must be in the range 0: ", ec_max_payload)
+                    # At present set the last payload to new so that the script will not try to apply continously
+                    # Need to propagate this error to front end.
+                    ec_last_payload_mass = ec_payload_mass
+                    ec_last_payload_cog = ec_payload_cog
+                end
+            end
+
+            # check if the divergence thresholds have changed
+            if (ec_max_joint_divergence_thresholds != ec_last_max_joint_divergence_thresholds):
+                textmsg("max_joint_divergence_thresholds = ", ec_max_joint_divergence_thresholds)
+                ec_last_max_joint_divergence_thresholds = ec_max_joint_divergence_thresholds
+            end
+
+            # check if the transition to the desired mode is allowed (currently all mode transitions are allowed)
+            if (ec_desired_mode != ec_actual_mode):
+                if (ec_actual_mode == ec_MODE_IDLE):
+                    ec_actual_mode = ec_desired_mode
+                elif (ec_actual_mode == ec_MODE_TEACH):
+                    ec_actual_mode = ec_desired_mode
+                elif (ec_actual_mode == ec_MODE_SERVO):
+                    ec_actual_mode = ec_desired_mode
+                else:
+                    textmsg("unknown mode received: mode = ", ec_desired_mode)
+                    halt
+                end
+            end
+
+            # entry/exit invokes
+            if (ec_actual_mode != ec_last_mode_comm):
+                # entry invokes
+                if (ec_actual_mode == ec_MODE_IDLE):
+                    textmsg("running entry invokes for IDLE")
+                elif (ec_actual_mode == ec_MODE_TEACH):
+                    textmsg("running entry invokes for TEACH")
+                elif (ec_actual_mode == ec_MODE_SERVO):
+                    textmsg("running entry invokes for SERVO")
+                end
+                ec_last_mode_comm = ec_actual_mode
+                reset_buf()
+            end
+
+            if (ec_sync_state == ec_SYNC_STATE_EXTERNAL_TO_ROBOT and ec_actual_mode == ec_MODE_SERVO):
+                push_waypoint()
+            end
+
+            # check for sequence_id timeout
+            if (ec_sequence_id > ec_last_sequence_id):
+                ec_last_sequence_id = ec_sequence_id
+                ec_stale_sequence_id_counter = 0
+            else:
+                ec_stale_sequence_id_counter = ec_stale_sequence_id_counter + 1
+                if (ec_stale_sequence_id_counter > ec_STALE_SEQUENCE_ID_COUNTER_LIMIT):
+                    textmsg("stale sequence ID counter exceeded limit")
+                    textmsg("sequence_id = ", ec_sequence_id)
+                    textmsg("sequence_id last = ", ec_last_sequence_id)
+                    textmsg("sequence_id counter = ", ec_stale_sequence_id_counter)
+                    textmsg("sequence_id limit = ", ec_STALE_SEQUENCE_ID_COUNTER_LIMIT)
+                    halt
+                end
+            end
+
+            # write output registers (to external controller)
+            write_output_integer_register(ec_ACTUAL_MODE_OUTPUT_INT_REG, ec_actual_mode)
+            write_output_integer_register(ec_LAST_SEQUENCE_ID_OUTPUT_INT_REG, ec_last_sequence_id)
+            write_output_float_register(ec_LAG_TIME_OUTPUT_FLOAT_REG, ec_lag_time)
+
+            # update invokes (NOTE: must consume remaining period)
+            sync()
+        end
+    end
+    ec_rcv_thread = run external_comm_thread()
+
+    ##################################
+    # Divergence threshold check
+    ##################################
+    def is_diverged(desired_positions, max_divergence):
+        ec_actual_joint_values = get_actual_joint_positions()
+        ec_joint0_error = norm(desired_positions[0] - ec_actual_joint_values[0])
+        ec_joint1_error = norm(desired_positions[1] - ec_actual_joint_values[1])
+        ec_joint2_error = norm(desired_positions[2] - ec_actual_joint_values[2])
+        ec_joint3_error = norm(desired_positions[3] - ec_actual_joint_values[3])
+        ec_joint4_error = norm(desired_positions[4] - ec_actual_joint_values[4])
+        ec_joint5_error = norm(desired_positions[5] - ec_actual_joint_values[5])
+
+        return (ec_joint0_error > max_divergence[0]) or (ec_joint1_error > max_divergence[1]) or (ec_joint2_error > max_divergence[2]) or (ec_joint3_error > max_divergence[3]) or (ec_joint4_error > max_divergence[4]) or (ec_joint5_error > max_divergence[5])
+    end
+
+    ##################################
+    # Control Thread
+    ##################################
+    thread external_control_thread():
+        while (True):
+            # entry/exit invokes
+            if (ec_actual_mode != ec_last_mode):
+                textmsg("changing mode")
+                textmsg("from mode = ", ec_last_mode)
+                textmsg("to mode = ", ec_actual_mode)
+
+                # exit invokes
+                if (ec_last_mode == ec_MODE_IDLE):
+                    textmsg("running exit invokes for IDLE")
+                elif (ec_last_mode == ec_MODE_TEACH):
+                    textmsg("running exit invokes for TEACH")
+                    end_teach_mode()
+                elif (ec_last_mode == ec_MODE_SERVO):
+                    textmsg("running exit invokes for SERVO: Stopping...")
+                    while (not is_steady()):
+                        stopj(50)
+                    end
+                    textmsg("finished exit invokes for SERVO")
+                end
+
+                # entry invokes
+                if (ec_actual_mode == ec_MODE_IDLE):
+                    textmsg("running entry invokes for IDLE")
+                elif (ec_actual_mode == ec_MODE_TEACH):
+                    textmsg("running entry invokes for TEACH")
+                    teach_mode()
+                elif (ec_actual_mode == ec_MODE_SERVO):
+                    textmsg("running entry invokes for SERVO")
+                end
+                ec_last_mode = ec_actual_mode
+            end
+
+            # update invokes (NOTE: must consume remaining period)
+            if (ec_sync_state == ec_SYNC_STATE_EXTERNAL_TO_ROBOT and ec_actual_mode == ec_MODE_SERVO):
+                if (ec_buf_can_pop == True):
+                    pop_waypoint()
+                end
+
+                if (is_diverged(ec_desired_joint_positions, ec_max_joint_divergence_thresholds)):
+                    textmsg("Max divergence threshold crossed.")
+                    halt
+                end
+
+                # passed all the divergence checks, move the robot
+                servoj(ec_desired_joint_positions, t = ec_desired_movement_time, lookahead_time = ec_SERVOJ_LOOKAHEAD_TIME, gain = ec_SERVOJ_GAIN)
+                # Optional: Call servoj again until converged to safe threshold. This would kick-in when speed scaling occurs.
+                # We're using the same time 't' as previous servoj() call for now since we don't have access to the effect of time scaling changes in previous servoj
+                while (is_diverged(ec_desired_joint_positions, ec_joint_convergence_thresholds)):
+                    servoj(ec_desired_joint_positions, t = ec_desired_movement_time, lookahead_time = ec_SERVOJ_LOOKAHEAD_TIME, gain = ec_SERVOJ_GAIN)
+                end
+            else:
+                sync()
+            end
+        end
+    end
+
+    ec_ctrl_thread = run external_control_thread()
+
+    ##################################
+    # Main loop for interpreter mode
+    ##################################
+
+    # Use main thread for interpreter mode until halt or stop
+    while (True):
+        interpreter_mode(False, False)
+    end
+end
